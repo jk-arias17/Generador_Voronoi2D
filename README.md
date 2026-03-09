@@ -1,5 +1,3 @@
-Para ejecutar el código, se debe instalar las librerías necesarias y estas se encuentran en el archivo requirements.txt. 
-Para ello, es necesario ubicar la carpeta donde se va a ejecutar el código y ya teniendo referenciado esta, se escribe el siguiente comando en la terminal del
-programa a utilizar: "pip install -r requirements.txt".
+Para ejecutar el código, es necesario instalar previamente las librerías requeridas, las cuales se encuentran especificadas en el archivo requirements.txt. Para ello, debe ubicarse en la carpeta desde la cual se ejecutará el código y, una vez situada en dicha ruta, ingresar en la terminal del programa el siguiente comando: pip install -r requirements.txt
 
-En caso de obtener una malla en la cual se note que un agregado se encuentrA adentro de una matriz, se recomienda bajar el área objetivo de matriz con el fin de solucionar dicha discrepancia.
+En caso de obtener una malla en la que se observe que un agregado se encuentra dentro de una partícula de matriz, se recomienda reducir el área objetivo de esta última con el fin de corregir dicha discrepancia.
