@@ -12,11 +12,13 @@ from shapely.ops import polygonize as _polygonize
 
 # 1. Parámetros del dominio y la mezcla
 
-# MODIFICAR
+# --------- MODIFICAR --------------------------------------------------------------------------------------------------------
 B = 150  # ancho del dominio en mm
 H = 150  # alto del dominio en mm
-fraccion_agregados = 0.4 # Porcentaje de área total que será agregado
+fraccion_agregados = 0.05 # Porcentaje de área total que será agregado
 area_celda_matriz = 5 # Área objetivo de matriz (mm^2)
+fracciones = np.array([0.10, 0.35, 0.40, 0.15]) # fracción de cada granulometría sobre el total de agregados: [3/4", 1/2", 3/8", #4]
+# ----------------------------------------------------------------------------------------------------------------------------
 
 dominio = box(0, 0, B, H)
 area_dominio = B * H
@@ -33,8 +35,8 @@ area_minima = 1e-8
 # Para testear con un solo material, poner True (todo sale como código 5)
 material_uniforme = False
 
-# Fracción de cada granulometría sobre el total de agregados: [3/4", 1/2", 3/8", #4]
-fracciones = np.array([0.10, 0.35, 0.40, 0.15])
+
+
 area_total_agg = fraccion_agregados * area_dominio
 area_por_clase = fracciones * area_total_agg
 
