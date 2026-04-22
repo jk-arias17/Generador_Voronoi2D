@@ -1,0 +1,1005 @@
+# 0. Librerías
+import numpy as np
+import matplotlib.pyplot as plt
+from shapely.geometry import Polygon, Point, MultiPolygon, box, LineString
+from shapely.ops import unary_union
+from shapely.strtree import STRtree
+from scipy.spatial import Voronoi, cKDTree
+import math
+import random
+import time
+from shapely.ops import polygonize as _polygonize
+
+# 1. Parámetros del dominio y la mezcla
+
+# --------- MODIFICAR --------------------------------------------------------------------------------------------------------
+B = 200  # ancho del dominio en mm
+H = 200  # alto del dominio en mm
+fraccion_agregados = 0.5  # Porcentaje de área total que será agregado
+area_celda_matriz  = 10   # Área objetivo de cada celda de matriz (mm^2)
+
+# Si se desea agregar más agregados, poner en la siguiente lista de diccionarios el tipo de agregado tal cual el formato
+tipos_agregados = [
+    {"nombre": '3/4"', "fraccion": 0.10, "dmin": 13.00, "dmax": 19.00, "radio_sep": 22.0, "espesor_min": 0.40},
+    {"nombre": '1/2"', "fraccion": 0.35, "dmin":  9.50, "dmax": 13, "radio_sep": 18.0, "espesor_min": 0.35},
+    {"nombre": '3/8"', "fraccion": 0.40, "dmin":  4.75, "dmax":  9.50, "radio_sep": 14.0, "espesor_min": 0.25},
+    {"nombre":  '#4',  "fraccion": 0.15, "dmin":  4.00, "dmax":  4.75, "radio_sep": 10.0, "espesor_min": 0.12},
+]
+elongacion = 1.2  # Relación de alargamiento de partículas
+min_lados  = 5    # Número mínimo de lados de cada partícula de agregado
+# ----------------------------------------------------------------------------------------------------------------------------
+
+dominio      = box(0, 0, B, H)
+area_dominio = B * H
+
+# Activar exportación de archivos para VEM
+exportar_txts        = True
+archivo_nodos        = "Input_nodos.txt"
+archivo_conectividad = "Input_conectividad.txt"
+
+# Precisión de redondeo para unificar nodos (en mm).
+precision_nodos = 4
+# Área mínima para considerar un polígono válido (descarta sliver residuales)
+area_minima = 1e-8
+# Para testear con un solo material, poner True (todo sale como código de matriz)
+material_uniforme = False
+
+# ── Derivados de tipos_agregados ──────────────────────────────────────────────
+n_tipos      = len(tipos_agregados)
+codigo_matriz = n_tipos + 1   # código VEM para la matriz
+
+fracciones = np.array([t["fraccion"] for t in tipos_agregados], dtype=float)
+fracciones /= fracciones.sum()   # normalizar por si no suman exactamente 1
+
+area_total_agg = fraccion_agregados * area_dominio
+area_por_clase = fracciones * area_total_agg
+
+areas_min  = np.array([math.pi * (t["dmin"] / 2) ** 2 for t in tipos_agregados])
+areas_max  = np.array([math.pi * (t["dmax"] / 2) ** 2 for t in tipos_agregados])
+areas_media = 0.5 * (areas_min + areas_max)
+
+# Tolerancia para considerar que se alcanzó el área objetivo (2 %)
+tolerancia = 0.02
+
+semilla = None  # None = aleatoria cada vez; poner un número para reproducir resultados
+
+radio_separacion = {i + 1: tipos_agregados[i]["radio_sep"]   for i in range(n_tipos)}
+radio_minimo     = {k: 0.70 * v for k, v in radio_separacion.items()}
+espesor_min      = {i + 1: tipos_agregados[i]["espesor_min"] for i in range(n_tipos)}
+
+# Factores mínimos de relajación (cuando el dominio ya está muy lleno)
+min_radio_factor = 0.65
+min_gap_factor   = 0.55
+paso_radio       = 0.90
+paso_gap         = 0.88
+
+# Límites para no colapsar con dominios muy grandes
+max_puntos = 12000
+max_celdas = 30000
+
+
+# 2. Funciones auxiliares de geometría
+
+def reparar(geom):
+    if geom is None or geom.is_empty:
+        return geom
+    try:
+        from shapely.validation import make_valid
+        g2 = make_valid(geom)
+        return g2 if (g2 is not None and not g2.is_empty) else geom
+    except Exception:
+        try:
+            g2 = geom.buffer(0)
+            return g2 if (g2 is not None and not g2.is_empty) else geom
+        except Exception:
+            return geom
+
+def separar(geom):
+    geom = reparar(geom)
+    if geom is None or geom.is_empty:
+        return []
+    if isinstance(geom, MultiPolygon):
+        return [reparar(g) for g in geom.geoms if (g and (not g.is_empty) and g.area > 1e-9)]
+    return [geom] if geom.area > 1e-9 else []
+
+def puntos_en_poligono(poligono: Polygon, n: int, max_intentos: int = 400000):
+    poligono = reparar(poligono)
+    if poligono is None or poligono.is_empty:
+        return np.zeros((0, 2))
+    minx, miny, maxx, maxy = poligono.bounds
+    puntos = []
+    intentos = 0
+    while len(puntos) < n and intentos < max_intentos:
+        intentos += 1
+        x = random.uniform(minx, maxx)
+        y = random.uniform(miny, maxy)
+        if poligono.contains(Point(x, y)):
+            puntos.append((x, y))
+    return np.array(puntos)
+
+def puntos_en_geom(geom, n: int):
+    geom = reparar(geom)
+    if geom is None or geom.is_empty or n <= 0:
+        return np.zeros((0, 2))
+    piezas = separar(geom)
+    if not piezas:
+        return np.zeros((0, 2))
+    areas  = np.array([p.area for p in piezas], dtype=float)
+    probs  = areas / areas.sum()
+    conteos = np.random.multinomial(n, probs)
+    lista_pts = []
+    for p, k in zip(piezas, conteos):
+        if k <= 0:
+            continue
+        pts = puntos_en_poligono(p, k)
+        if pts.shape[0] > 0:
+            lista_pts.append(pts)
+    return np.vstack(lista_pts) if lista_pts else np.zeros((0, 2))
+
+def voronoi_recorte(semillas: np.ndarray, region):
+    region = reparar(region)
+    if region is None or region.is_empty or semillas.shape[0] < 3:
+        return []
+    minx, miny, maxx, maxy = region.bounds
+    L = max(maxx - minx, maxy - miny) * 10.0
+    extra = np.array([
+        [minx - L, miny - L],
+        [minx - L, maxy + L],
+        [maxx + L, miny - L],
+        [maxx + L, maxy + L],
+    ])
+    puntos = np.vstack([semillas, extra])
+    vor    = Voronoi(puntos)
+    celdas = []
+    N = semillas.shape[0]
+    for i in range(N):
+        idx_region = vor.point_region[i]
+        reg = vor.regions[idx_region]
+        if -1 in reg or len(reg) == 0:
+            continue
+        celda = reparar(Polygon(vor.vertices[reg]))
+        if celda is None or celda.is_empty:
+            continue
+        clip = reparar(celda.intersection(region))
+        if clip is None or clip.is_empty:
+            continue
+        if isinstance(clip, MultiPolygon):
+            clip = max(clip.geoms, key=lambda g: g.area)
+            clip = reparar(clip)
+        if clip is not None and (not clip.is_empty) and clip.area > 1e-9:
+            celdas.append(clip)
+    return celdas
+
+
+# 3. Índice espacial y generadores de puntos
+
+def armar_indice(celdas):
+    return STRtree(celdas)
+
+def celda_en_punto(tree, celdas, x, y):
+    p    = Point(float(x), float(y))
+    cand = tree.query(p)
+    if len(cand) == 0:
+        return None
+    primero = cand[0]
+    if hasattr(primero, "contains"):
+        # Shapely 1.x
+        for g in cand:
+            if g.contains(p):
+                for i, cc in enumerate(celdas):
+                    if cc is g:
+                        return i
+                for i, cc in enumerate(celdas):
+                    if cc.equals(g):
+                        return i
+        return None
+    else:
+        # Shapely 2.x
+        for idx in cand:
+            ii = int(idx)
+            if celdas[ii].contains(p):
+                return ii
+        return None
+
+def puntos_grilla(B, H, nx=10, ny=10):
+    while True:
+        celdillas = [(i, j) for i in range(nx) for j in range(ny)]
+        random.shuffle(celdillas)
+        for i, j in celdillas:
+            x0 = (i / nx) * B;  x1 = ((i + 1) / nx) * B
+            y0 = (j / ny) * H;  y1 = ((j + 1) / ny) * H
+            yield (random.uniform(x0, x1), random.uniform(y0, y1))
+
+def encoger(poligono, g):
+    poligono = reparar(poligono)
+    if poligono is None or poligono.is_empty:
+        return None
+    p = reparar(poligono.buffer(-g, join_style=2))
+    if p is None or p.is_empty:
+        return None
+    if isinstance(p, MultiPolygon):
+        p = max(p.geoms, key=lambda gg: gg.area)
+        p = reparar(p)
+    return p if (p is not None and not p.is_empty and p.area > 1e-9) else None
+
+def escalar(poligono, area_obj):
+    poligono = reparar(poligono)
+    if poligono is None or poligono.is_empty or poligono.area <= 1e-12:
+        return None
+    s = math.sqrt(area_obj / poligono.area)
+    if s <= 0:
+        return None
+    from shapely import affinity
+    p2 = reparar(affinity.scale(poligono, xfact=s, yfact=s, origin="centroid"))
+    return p2 if (p2 is not None and not p2.is_empty and p2.area > 1e-9) else None
+
+def aplicar_alargamiento(poligono, e):
+    """Estira el polígono preservando el área. e=1.0 sin cambio; e>1 más alargado.
+    Se aplica una rotación aleatoria para que la orientación no sea siempre horizontal."""
+    if e <= 1.0 + 1e-9 or poligono is None or poligono.is_empty:
+        return poligono
+    from shapely import affinity
+    factor = math.sqrt(e)
+    angulo = random.uniform(0.0, math.pi)
+    p = affinity.scale(poligono, xfact=factor, yfact=1.0 / factor, origin="centroid")
+    p = affinity.rotate(p, angulo, origin="centroid", use_radians=True)
+    p = reparar(p)
+    return p if (p is not None and not p.is_empty and p.area > 1e-9) else poligono
+
+def dimensionar_particula(pin, d_objetivo, e, theta, d_minimo):
+    """
+    Dimensiona la plantilla `pin` para que el polígono resultante tenga:
+        - ancho `d * e` entre vértices extremos a lo largo de la dirección θ  (eje mayor)
+        - ancho `d / e` perpendicular a θ                                     (eje menor)
+    donde `d` = min(d_objetivo, d_que_cabe_en_la_celda). Esto preserva el
+    área equivalente circular π·(d/2)². Si `d` queda por debajo de `d_minimo`
+    (no cabe ni siquiera el tamaño mínimo del tipo), retorna (None, 0.0).
+    Retorna (polígono_dimensionado, d_aplicado).
+    """
+    if pin is None or pin.is_empty:
+        return None, 0.0
+    from shapely import affinity
+    elong = max(float(e), 1.0)
+    # Rotar para alinear θ con el eje X → medimos Feret diameter como ancho AABB
+    p_rot = affinity.rotate(pin, -theta, origin='centroid', use_radians=True)
+    minx, miny, maxx, maxy = p_rot.bounds
+    w_along = maxx - minx
+    w_perp  = maxy - miny
+    if w_along <= 1e-9 or w_perp <= 1e-9:
+        return None, 0.0
+    # d máximo que cabe respetando ambos ejes (con 2% de margen)
+    margen = 0.98
+    d_cabe_mayor = (w_along * margen) / elong    # L_mayor = d·e  ≤  w_along
+    d_cabe_menor = (w_perp  * margen) * elong    # L_menor = d/e  ≤  w_perp
+    d_cabe = min(d_cabe_mayor, d_cabe_menor)
+    d = min(d_objetivo, d_cabe)
+    if d < d_minimo:
+        return None, 0.0
+    target_mayor = d * elong
+    target_menor = d / elong
+    sx = target_mayor / w_along
+    sy = target_menor / w_perp
+    p_rot = affinity.scale(p_rot, xfact=sx, yfact=sy, origin='centroid')
+    p = affinity.rotate(p_rot, theta, origin='centroid', use_radians=True)
+    p = reparar(p)
+    if p is None or p.is_empty or p.area <= 1e-9:
+        return None, 0.0
+    return p, d
+
+def asegurar_min_lados(poligono, min_l):
+    """Garantiza al menos min_l lados dividiendo iterativamente la arista más larga."""
+    if min_l <= 2 or poligono is None or poligono.is_empty:
+        return poligono
+    coords = list(poligono.exterior.coords[:-1])
+    while len(coords) < min_l:
+        n = len(coords)
+        max_d, max_i = -1.0, 0
+        for i in range(n):
+            x1, y1 = coords[i]
+            x2, y2 = coords[(i + 1) % n]
+            d = (x2 - x1) ** 2 + (y2 - y1) ** 2
+            if d > max_d:
+                max_d, max_i = d, i
+        x1, y1 = coords[max_i]
+        x2, y2 = coords[(max_i + 1) % len(coords)]
+        coords.insert(max_i + 1, ((x1 + x2) / 2.0, (y1 + y2) / 2.0))
+    p = reparar(Polygon(coords))
+    return p if (p is not None and not p.is_empty and p.area > 1e-9) else poligono
+
+def subdividir_matriz(region, area_obj):
+    region = reparar(region)
+    if region is None or region.is_empty:
+        return []
+    A = region.area
+    n = int(round(A / max(area_obj, 1e-9)))
+    n = max(3, min(max_puntos, n))
+    if n < 3:
+        return separar(region)
+    pts = puntos_en_geom(region, n)
+    if pts.shape[0] < 3:
+        return separar(region)
+    celdas = voronoi_recorte(pts, region)
+    if len(celdas) > max_celdas:
+        celdas = random.sample(celdas, max_celdas)
+    union = reparar(unary_union(celdas)) if celdas else None
+    if union is not None and (not union.is_empty):
+        huecos = reparar(region.difference(union))
+        celdas.extend(separar(huecos))
+    return celdas
+
+def subdividir_celda(celda, area_obj):
+    celda = reparar(celda)
+    if celda is None or celda.is_empty:
+        return []
+    n = int(round(celda.area / max(area_obj, 1e-9)))
+    n = max(3, min(250, n))
+    pts = puntos_en_poligono(celda, n)
+    if pts.shape[0] < 3:
+        return [celda]
+    return voronoi_recorte(pts, celda)
+
+
+# 4. Voronoi global
+
+def voronoi_base():
+    area_promedio = float((fracciones * areas_media).sum())
+    N = int(round(area_total_agg / max(area_promedio, 1e-9)))
+    N = max(250, N)
+    semillas = np.zeros((N, 2))
+    semillas[:, 0] = np.random.rand(N) * B
+    semillas[:, 1] = np.random.rand(N) * H
+    return voronoi_recorte(semillas, dominio)
+
+
+# 5. Asignación de agregados (todos los tipos excepto el último)
+
+def asignar_granu(celdas, indices_libres, id_clase, area_obj_clase, tree, gen_puntos,
+                  centros, radio_check, radio_factor=1.0, gap_factor=1.0):
+    gap = espesor_min[id_clase] * float(gap_factor)
+    area_acum = 0.0
+    agregados = {}
+    usadas    = set()
+    libres    = set(indices_libres)
+
+    max_intentos = max(700000, 18000 * max(1, len(indices_libres)))
+    rmin   = float(radio_check.get(id_clase, 0.0)) * float(radio_factor)
+    r_duro = float(radio_minimo.get(id_clase, 0.0))
+    pts = np.array(centros, dtype=float) if len(centros) > 0 else np.zeros((0, 2), dtype=float)
+    kdt = cKDTree(pts) if pts.shape[0] > 0 else None
+    rebuild_every = 25
+    added = 0
+
+    intentos = 0
+    while (area_acum < area_obj_clase * (1 - tolerancia)) and (intentos < max_intentos) and libres:
+        intentos += 1
+        x, y = next(gen_puntos)
+
+        idx = celda_en_punto(tree, celdas, x, y)
+        if idx is None or idx not in libres:
+            continue
+
+        if kdt is not None and (r_duro > 0.0 or rmin > 0.0):
+            cxy = celdas[idx].centroid
+            cx, cy = float(cxy.x), float(cxy.y)
+            if r_duro > 0.0 and len(kdt.query_ball_point([cx, cy], r=r_duro)) > 0:
+                continue
+            if rmin > 0.0 and len(kdt.query_ball_point([cx, cy], r=rmin)) > 0:
+                continue
+
+        pin = encoger(celdas[idx], gap)
+        if pin is None:
+            continue
+
+        # Dimensionado por diámetro: cada partícula recibe un d sorteado en [dmin, dmax]
+        # y una única dirección θ aleatoria. dimensionar_particula ajusta ancho = d·e
+        # a lo largo de θ y ancho = d/e perpendicular (área equivalente ≈ π·(d/2)²).
+        dmin_t = tipos_agregados[id_clase - 1]["dmin"]
+        dmax_t = tipos_agregados[id_clase - 1]["dmax"]
+        theta  = random.uniform(0.0, math.pi)
+        d_obj  = random.uniform(dmin_t, dmax_t)
+        agg, d_final = dimensionar_particula(pin, d_obj, elongacion, theta, dmin_t)
+        if agg is None:
+            continue
+
+        # Recortar a pin para preservar el gap con celdas vecinas
+        agg = reparar(agg.intersection(pin))
+        if agg is None or agg.is_empty:
+            continue
+        if isinstance(agg, MultiPolygon):
+            agg = max(agg.geoms, key=lambda g: g.area)
+            agg = reparar(agg)
+        if agg is None or agg.is_empty:
+            continue
+
+        # Verificación silenciosa: área real vs área circular esperada π·(d/2)²
+        area_esperada = math.pi * (d_final / 2.0) ** 2
+        desviacion = abs(agg.area - area_esperada) / max(area_esperada, 1e-9)
+        if desviacion > 0.10:
+            # La forma poligonal se aleja más del 10 % del círculo equivalente;
+            # aún así se conserva la partícula para no dejar huecos.
+            pass
+
+        agg = asegurar_min_lados(agg, min_lados)
+        if agg is None or agg.is_empty:
+            continue
+
+        agregados[idx] = agg
+        usadas.add(idx)
+        libres.remove(idx)
+        area_acum += agg.area
+
+        cxy = celdas[idx].centroid
+        centros.append((float(cxy.x), float(cxy.y)))
+        added += 1
+        if added >= rebuild_every:
+            pts = np.array(centros, dtype=float)
+            kdt = cKDTree(pts) if pts.shape[0] > 0 else None
+            added = 0
+
+    return agregados, usadas, area_acum
+
+
+# 6. Asignación del tipo más fino (último en la lista)
+
+def preparar_celdas_fino(celdas, indices_libres, id_clase):
+    area_obj = areas_media[id_clase - 1] / fraccion_agregados
+    salida = []
+    for i in indices_libres:
+        celda = celdas[i]
+        if celda.area > 3 * area_obj:
+            salida.extend(subdividir_celda(celda, area_obj))
+        else:
+            salida.append(celda)
+    return salida
+
+def asignar_fino(celdas_fino, area_obj, id_clase):
+    gap          = espesor_min[id_clase]
+    dmin_t       = tipos_agregados[id_clase - 1]["dmin"]
+    dmax_t       = tipos_agregados[id_clase - 1]["dmax"]
+    area_acum    = 0
+    lista_agg    = []
+    lista_matriz = []
+    celdas_fino  = sorted(celdas_fino, key=lambda p: -p.area)
+
+    for celda in celdas_fino:
+        if area_acum >= area_obj * (1 - tolerancia):
+            lista_matriz.extend(subdividir_matriz(celda, area_celda_matriz))
+            continue
+        pin = encoger(celda, gap)
+        if pin is None:
+            lista_matriz.extend(subdividir_matriz(celda, area_celda_matriz))
+            continue
+
+        # Dimensionado por diámetro: sorteo d y θ por partícula
+        theta = random.uniform(0.0, math.pi)
+        d_obj = random.uniform(dmin_t, dmax_t)
+        agg, d_final = dimensionar_particula(pin, d_obj, elongacion, theta, dmin_t)
+        if agg is None:
+            lista_matriz.extend(subdividir_matriz(celda, area_celda_matriz))
+            continue
+
+        agg = reparar(agg.intersection(pin))
+        if agg is None or agg.is_empty:
+            lista_matriz.extend(subdividir_matriz(celda, area_celda_matriz))
+            continue
+        if isinstance(agg, MultiPolygon):
+            agg = max(agg.geoms, key=lambda g: g.area)
+            agg = reparar(agg)
+        if agg is None or agg.is_empty:
+            lista_matriz.extend(subdividir_matriz(celda, area_celda_matriz))
+            continue
+
+        # Verificación silenciosa: área real vs área circular esperada
+        area_esperada = math.pi * (d_final / 2.0) ** 2
+        desviacion = abs(agg.area - area_esperada) / max(area_esperada, 1e-9)
+        if desviacion > 0.10:
+            pass  # se conserva la partícula para no dejar huecos
+
+        agg = asegurar_min_lados(agg, min_lados)
+        if agg is None or agg.is_empty:
+            lista_matriz.extend(subdividir_matriz(celda, area_celda_matriz))
+            continue
+
+        lista_agg.append(agg)
+        area_acum += agg.area
+        anillo = reparar(celda.difference(agg))
+        lista_matriz.extend(subdividir_matriz(anillo, area_celda_matriz))
+
+    return lista_agg, lista_matriz, area_acum
+
+def matriz_macro(celdas, aggs_dict, area_obj):
+    partes = []
+    for idx_celda, agg in aggs_dict.items():
+        anillo = reparar(celdas[idx_celda].difference(agg))
+        partes.extend(subdividir_matriz(anillo, area_obj))
+    return partes
+
+
+# 7. Visualización
+
+# Paleta de colores para los tipos de agregado
+_PALETA = [
+    (1.00, 0.30, 0.30),  # rojo
+    (0.20, 0.40, 1.00),  # azul
+    (0.20, 0.80, 0.20),  # verde
+    (1.00, 1.00, 0.00),  # amarillo
+    (1.00, 0.60, 0.00),  # naranja
+    (0.80, 0.20, 0.80),  # morado
+    (0.00, 0.80, 0.80),  # cian
+    (0.60, 0.20, 0.00),  # café
+    (0.80, 0.80, 0.20),  # oliva
+    (0.20, 0.60, 0.60),  # teal
+]
+
+def _color_tipo(i):
+    return _PALETA[i % len(_PALETA)]
+
+def graficar_voronoi_base(celdas):
+    """Muestra el diagrama de Voronoi base antes de asignar materiales."""
+    cmap = plt.get_cmap("tab20")
+    fig, ax = plt.subplots(figsize=(6, 6))
+    for i, celda in enumerate(celdas):
+        celda = reparar(celda)
+        if celda is None or celda.is_empty:
+            continue
+        xs, ys = celda.exterior.xy
+        ax.fill(xs, ys, facecolor=cmap(i % 20), alpha=0.7,
+                edgecolor="k", linewidth=0.5, antialiased=False)
+    ax.set_aspect("equal", "box")
+    ax.set_xlim(0, B); ax.set_ylim(0, H)
+    ax.set_xlabel("x [mm]")
+    ax.set_ylabel("y [mm]")
+    ax.set_title("Diagrama de Voronoi base (antes de modificaciones)")
+    plt.tight_layout()
+    plt.show()
+
+def graficar(poligonos_matriz, listas_agg):
+    """listas_agg: lista de listas de polígonos, una por tipo de agregado."""
+    color_mat = (0.85, 0.85, 0.85)
+    fig, ax = plt.subplots(figsize=(6, 6))
+    for p in poligonos_matriz:
+        p = reparar(p)
+        if p is None or p.is_empty:
+            continue
+        xs, ys = p.exterior.xy
+        ax.fill(xs, ys, facecolor=color_mat, edgecolor="k", linewidth=0.01, antialiased=False)
+    for i, lista in enumerate(listas_agg):
+        color = _color_tipo(i)
+        for p in lista:
+            if p is None or p.is_empty:
+                continue
+            xs, ys = p.exterior.xy
+            ax.fill(xs, ys, facecolor=color, edgecolor="k", linewidth=0.01, antialiased=False)
+    ax.set_aspect("equal", "box")
+    ax.set_xlim(0, B); ax.set_ylim(0, H)
+    ax.set_xlabel("x [mm]")
+    ax.set_ylabel("y [mm]")
+    ax.set_title("Mezcla Voronoi 2D")
+    from matplotlib.patches import Patch
+    handles = [Patch(color=_color_tipo(i), label=tipos_agregados[i]["nombre"])
+               for i in range(n_tipos)]
+    handles.append(Patch(color=color_mat, label="Matriz"))
+    ax.legend(handles=handles, loc="upper right")
+    plt.tight_layout()
+    plt.show()
+
+def resumen(listas_agg):
+    areas_tipo = [sum(p.area for p in lst) if lst else 0.0 for lst in listas_agg]
+    total_agg  = sum(areas_tipo)
+    total_mat  = area_dominio - total_agg
+    print("Resumen:")
+    print(f"Área dominio            = {area_dominio:10.2f} mm^2")
+    print(f"Objetivo agregados      = {area_total_agg:10.2f} mm^2 ({100*area_total_agg/area_dominio:6.2f}%)")
+    print(f"Agregados logrados      = {total_agg:10.2f} mm^2 ({100*total_agg/area_dominio:6.2f}%)")
+    print(f"Matriz lograda          = {total_mat:10.2f} mm^2 ({100*total_mat/area_dominio:6.2f}%)")
+    print("")
+    if total_agg > 0:
+        print("Áreas reales:")
+        for tipo, A in zip(tipos_agregados, areas_tipo):
+            print(f'  {tipo["nombre"]:>6}  = {A:10.2f} mm^2 ({100*A/total_agg:6.2f}%)')
+
+
+# 8. Exportación de archivos para VEM
+
+tol_snap = 1e-4
+
+def _area_con_signo(coords):
+    n = len(coords)
+    s = 0.0
+    for i in range(n):
+        x1, y1 = coords[i]
+        x2, y2 = coords[(i + 1) % n]
+        s += x1 * y2 - x2 * y1
+    return s
+
+def _fix_tjunctions(code_coords_list, tol=tol_snap):
+    todos_verts = set()
+    for _, coords in code_coords_list:
+        todos_verts.update(coords)
+    verts     = list(todos_verts)
+    verts_arr = np.array(verts, dtype=float)
+    kd        = cKDTree(verts_arr)
+
+    result = []
+    for code, coords in code_coords_list:
+        n         = len(coords)
+        coords_arr = np.array(coords, dtype=float)
+        next_arr   = np.roll(coords_arr, -1, axis=0)
+        dx_all     = next_arr[:, 0] - coords_arr[:, 0]
+        dy_all     = next_arr[:, 1] - coords_arr[:, 1]
+        len2_all   = dx_all ** 2 + dy_all ** 2
+        seglen_all = np.sqrt(len2_all)
+
+        inserciones = {}
+
+        for i in range(n):
+            seg_len = seglen_all[i]
+            if seg_len < tol:
+                continue
+            ax, ay = coords_arr[i]
+            bx, by = next_arr[i]
+            dx, dy = dx_all[i], dy_all[i]
+            len2   = len2_all[i]
+
+            cx, cy = (ax + bx) * 0.5, (ay + by) * 0.5
+            idxs = kd.query_ball_point([cx, cy], seg_len * 0.5 + tol)
+            if not idxs:
+                continue
+
+            cands = verts_arr[idxs]
+            not_a = ~((cands[:, 0] == ax) & (cands[:, 1] == ay))
+            not_b = ~((cands[:, 0] == bx) & (cands[:, 1] == by))
+            mask  = not_a & not_b
+            if not np.any(mask):
+                continue
+            cands = cands[mask]
+
+            cross   = dx * (cands[:, 1] - ay) - dy * (cands[:, 0] - ax)
+            perp_ok = np.abs(cross) <= tol * seg_len
+            if not np.any(perp_ok):
+                continue
+            cands = cands[perp_ok]
+
+            dot    = (cands[:, 0] - ax) * dx + (cands[:, 1] - ay) * dy
+            t_arr  = dot / len2
+            margin = tol / seg_len
+            t_ok   = (t_arr > margin) & (t_arr < 1.0 - margin)
+            if not np.any(t_ok):
+                continue
+
+            cands  = cands[t_ok]
+            t_vals = t_arr[t_ok]
+            orden  = np.argsort(t_vals)
+            inserciones[i] = [(t_vals[j], (float(cands[j, 0]), float(cands[j, 1])))
+                              for j in orden]
+
+        nuevas = []
+        for i in range(n):
+            nuevas.append(coords[i])
+            if i in inserciones:
+                for _, v in inserciones[i]:
+                    nuevas.append(v)
+
+        clean = []
+        for v in nuevas:
+            if not clean or v != clean[-1]:
+                clean.append(v)
+        if len(clean) >= 2 and clean[0] == clean[-1]:
+            clean = clean[:-1]
+
+        if len(clean) < 3:
+            continue
+
+        if _area_con_signo(clean) < 0:
+            clean = clean[::-1]
+
+        result.append((code, clean))
+
+    return result
+
+
+def exportar_vem(poligonos_matriz, listas_agg,
+                 nombre_nodos=archivo_nodos,
+                 nombre_conect=archivo_conectividad,
+                 ndigits=precision_nodos):
+    """
+    Genera Input_nodos.txt e Input_conectividad.txt para el programa VEM.
+    Acepta cualquier número de tipos de agregado en listas_agg.
+    Código de material: 1..n_tipos para agregados, codigo_matriz para matriz.
+    """
+    # 1) Recopilar todos los agregados con su código de material
+    todos_aggs = []
+    for i, lista in enumerate(listas_agg):
+        code = i + 1
+        if not lista:
+            continue
+        for p in lista:
+            p = reparar(p)
+            if p is None or p.is_empty or p.area < area_minima:
+                continue
+            if isinstance(p, MultiPolygon):
+                for g in p.geoms:
+                    g = reparar(g)
+                    if g and not g.is_empty and g.area >= area_minima:
+                        todos_aggs.append((code, g))
+            else:
+                todos_aggs.append((code, p))
+
+    if not todos_aggs:
+        return
+
+    # 2) Unión de todos los agregados
+    union_aggs = reparar(unary_union([p for _, p in todos_aggs]))
+
+    # 3) Filtrar celdas de matriz
+    celdas_mat = []
+    for c in poligonos_matriz:
+        c = reparar(c)
+        if c is None or c.is_empty or c.area < area_minima:
+            continue
+        if isinstance(c, MultiPolygon):
+            for sc in c.geoms:
+                sc = reparar(sc)
+                if sc and not sc.is_empty and sc.area >= area_minima:
+                    celdas_mat.append(sc)
+        else:
+            celdas_mat.append(c)
+
+    # 4) Construir malla conforming con unary_union + polygonize
+    rings = [dominio.exterior]
+    for c in celdas_mat:
+        rings.append(c.exterior)
+        for ir in c.interiors:
+            rings.append(ir)
+    for g in separar(union_aggs):
+        rings.append(g.exterior)
+
+    # 4b) Cortar celdas de matriz con hueco: línea vértice-a-vértice
+    #     entre el contorno exterior y cada anillo interior, usando el par
+    #     de vértices EXISTENTES más cercano (evita T-junctions con vecinos).
+    #     polygonize no respeta huecos, por lo que el corte convierte la
+    #     región anular en piezas simples sin polígonos anidados.
+    for c in celdas_mat:
+        if not c.interiors:
+            continue
+        ext_coords = list(c.exterior.coords)
+        for interior in c.interiors:
+            int_coords = list(interior.coords)
+            best_ext, best_int, best_d = None, None, float("inf")
+            for ex, ey in ext_coords:
+                for ix, iy in int_coords:
+                    d = (ex - ix) ** 2 + (ey - iy) ** 2
+                    if d < best_d:
+                        best_d, best_ext, best_int = d, (ex, ey), (ix, iy)
+            if best_ext is not None and best_int is not None and best_d > 1e-18:
+                rings.append(LineString([best_ext, best_int]))
+
+    noded     = unary_union(rings)
+    raw_cells = list(_polygonize(noded))
+
+    if not raw_cells:
+        return
+
+    # 5) Asignar código de material con STRtree
+    polys_agg = [p for _, p in todos_aggs]
+    codes_agg = [c for c, _ in todos_aggs]
+    tree_agg  = STRtree(polys_agg)
+
+    elems_raw = []
+    for cell in raw_cells:
+        if cell is None or cell.is_empty or cell.area < area_minima:
+            continue
+        pt = cell.representative_point()
+        if not dominio.contains(pt):
+            continue
+        code  = codigo_matriz
+        cands = tree_agg.query(pt)
+        for cand in cands:
+            if not hasattr(cand, 'exterior'):   # Shapely 2.x → índices
+                idx = int(cand)
+                if polys_agg[idx].contains(pt):
+                    code = codes_agg[idx]
+                    break
+            else:                               # Shapely 1.x → geometrías
+                for i, ap in enumerate(polys_agg):
+                    if ap is cand and ap.contains(pt):
+                        code = codes_agg[i]
+                        break
+                else:
+                    continue
+                break
+        elems_raw.append((code, cell))
+
+    # 6) Mapa de nodos
+    nodo_map = {}
+    nodo_xy  = []
+
+    def get_nid(x, y):
+        key = (float(x), float(y))
+        if key not in nodo_map:
+            nodo_map[key] = len(nodo_xy)
+            nodo_xy.append(key)
+        return nodo_map[key]
+
+    elems = []
+    for code, poly in elems_raw:
+        raw = list(poly.exterior.coords)
+        if len(raw) >= 2 and raw[0] == raw[-1]:
+            raw = raw[:-1]
+        coords = []
+        for x, y in raw:
+            pt = (float(x), float(y))
+            if not coords or pt != coords[-1]:
+                coords.append(pt)
+        if len(coords) >= 2 and coords[0] == coords[-1]:
+            coords = coords[:-1]
+        if len(coords) < 3:
+            continue
+        area2 = sum((coords[i][0] * coords[(i+1) % len(coords)][1]
+                     - coords[(i+1) % len(coords)][0] * coords[i][1])
+                    for i in range(len(coords)))
+        if area2 < 0:
+            coords = coords[::-1]
+        ids = [get_nid(x, y) for x, y in coords]
+        clean = []
+        for nid in ids:
+            if not clean or nid != clean[-1]:
+                clean.append(nid)
+        if len(clean) >= 2 and clean[0] == clean[-1]:
+            clean = clean[:-1]
+        if len(set(clean)) < 3:
+            continue
+        elems.append((code, clean))
+
+    # 7) Fusión de nodos muy cercanos con Union-Find
+    merge_tol = 10.0 ** (2 - ndigits)
+    if len(nodo_xy) > 1:
+        _arr = np.array(nodo_xy, dtype=float)
+        _kd  = cKDTree(_arr)
+        _par = list(range(len(nodo_xy)))
+
+        def _find(x):
+            while _par[x] != x:
+                _par[x] = _par[_par[x]]
+                x = _par[x]
+            return x
+
+        for _i in range(len(nodo_xy)):
+            for _j in _kd.query_ball_point(_arr[_i], merge_tol):
+                if _j != _i:
+                    _ri, _rj = _find(_i), _find(_j)
+                    if _ri != _rj:
+                        _par[max(_ri, _rj)] = min(_ri, _rj)
+
+        _root_map = {}
+        _new_xy   = []
+        _remap    = [0] * len(nodo_xy)
+        for _i in range(len(nodo_xy)):
+            _r = _find(_i)
+            if _r not in _root_map:
+                _root_map[_r] = len(_new_xy)
+                _new_xy.append(nodo_xy[_r])
+            _remap[_i] = _root_map[_r]
+
+        nodo_xy = _new_xy
+        elems2  = []
+        for _code, _conn in elems:
+            _nc = [_remap[_n] for _n in _conn]
+            _cl = []
+            for _n in _nc:
+                if not _cl or _n != _cl[-1]:
+                    _cl.append(_n)
+            if len(_cl) >= 2 and _cl[0] == _cl[-1]:
+                _cl = _cl[:-1]
+            if len(set(_cl)) >= 3:
+                elems2.append((_code, _cl))
+        elems = elems2
+
+    # 8) Escribir archivos
+    N = len(nodo_xy)
+    with open(nombre_nodos, "w", encoding="utf-8") as f:
+        for i, (xmm, ymm) in enumerate(nodo_xy):
+            f.write(f"{i}\t{i + N}\t{xmm / 1000.0:.9f}\t{ymm / 1000.0:.9f}\t0\t0\t0\t0\n")
+    with open(nombre_conect, "w", encoding="utf-8") as f:
+        for eid, (code, conn) in enumerate(elems):
+            f.write("\t".join(map(str, [eid, code, code] + conn)) + "\n")
+
+
+# 9. Main
+
+def main():
+    if semilla is None:
+        seed = int(time.time() * 1000) % (2**32 - 1)
+    else:
+        seed = int(semilla)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    # 1) Voronoi global sobre el dominio completo
+    celdas = voronoi_base()
+
+    # Mostrar diagrama de Voronoi base ANTES de cualquier modificación
+    graficar_voronoi_base(celdas)
+
+    indices_libres = list(range(len(celdas)))
+    tree       = armar_indice(celdas)
+    gen_puntos = puntos_grilla(B, H, nx=12, ny=12)
+    centros    = {i + 1: [] for i in range(n_tipos)}
+
+    # 2) Asignar todos los tipos excepto el último con relajación progresiva
+    def asignar_con_relajacion(id_clase, area_obj):
+        radio_factor = 1.0
+        gap_factor   = 1.0
+        aggs         = {}
+        usadas_total = set()
+        area_acum    = 0.0
+
+        while True:
+            restante = max(0.0, area_obj - area_acum)
+            if restante <= area_obj * 1e-6:
+                break
+
+            nuevos, usadas, logrado = asignar_granu(
+                celdas, indices_libres, id_clase, restante,
+                tree, gen_puntos,
+                centros[id_clase], radio_separacion,
+                radio_factor=radio_factor, gap_factor=gap_factor
+            )
+
+            aggs.update(nuevos)
+            usadas_total |= usadas
+            area_acum += logrado
+            if area_acum > area_obj:
+                area_acum = area_obj
+
+            for u in usadas:
+                if u in indices_libres:
+                    indices_libres.remove(u)
+
+            if area_acum >= area_obj * (1 - tolerancia):
+                break
+            if len(indices_libres) == 0:
+                break
+
+            radio_factor *= paso_radio
+            gap_factor   *= paso_gap
+
+            if radio_factor < min_radio_factor and gap_factor < min_gap_factor:
+                break
+
+            radio_factor = max(radio_factor, min_radio_factor)
+            gap_factor   = max(gap_factor,   min_gap_factor)
+
+        return aggs, usadas_total, area_acum
+
+    listas_agg = []
+    for i in range(n_tipos - 1):
+        aggs, _, _ = asignar_con_relajacion(i + 1, area_por_clase[i])
+        listas_agg.append(list(aggs.values()))
+
+    # 3) Tipo más fino (último): subdividir celdas sobrantes y asignar
+    id_fino      = n_tipos
+    celdas_fino  = preparar_celdas_fino(celdas, indices_libres, id_fino)
+    lista_fino, _, _ = asignar_fino(celdas_fino, area_por_clase[id_fino - 1], id_fino)
+    listas_agg.append(lista_fino)
+
+    # 4) Construir la región de matriz en una sola llamada
+    union_aggs = reparar(unary_union([p for lst in listas_agg for p in lst]))
+    region_mat = reparar(dominio.difference(union_aggs)) if union_aggs else dominio
+    celdas_mat = subdividir_matriz(region_mat, area_celda_matriz)
+
+    # Exportar TXT para VEM
+    if exportar_txts:
+        exportar_vem(
+            celdas_mat, listas_agg,
+            nombre_nodos=archivo_nodos, nombre_conect=archivo_conectividad,
+            ndigits=precision_nodos
+        )
+
+    # Graficar resultado final y mostrar resumen
+    graficar(celdas_mat, listas_agg)
+    resumen(listas_agg)
+
+
+if __name__ == "__main__":
+    main()
